@@ -1,4 +1,6 @@
-"""Classical ML: k-means, perceptron, average precision, Jaccard similarity."""
+"""Classical ML: k-means, perceptron, and binary-classifier evaluation
+metrics (average precision, ROC/AUC, confusion-matrix metrics, Jaccard
+similarity)."""
 
 import numpy as np
 
@@ -136,6 +138,160 @@ def average_precision(y_true, y_scores):
     return float(np.sum((recall - recall_prev) * precision))
 
 
+def roc_curve(y_true, y_scores):
+    """Receiver Operating Characteristic (ROC) curve.
+
+    Sweeps a decision threshold over all scores (from "accept everything"
+    down to "accept nothing") and, at each distinct threshold, plots:
+        TPR (True Positive Rate / recall) = TP / (TP + FN) = TP / P
+        FPR (False Positive Rate)         = FP / (FP + TN) = FP / N
+    against each other. TPR is "of all actual positives, how many did we
+    catch"; FPR is "of all actual negatives, how many did we wrongly flag".
+    A perfect classifier hugs the top-left corner (TPR=1, FPR=0); a random
+    classifier traces the diagonal TPR=FPR.
+
+    Algorithm: sort by score descending (same setup as average_precision).
+    Walking down the sorted list, every positive example increases TP by
+    1 and every negative increases FP by 1, so cumulative sums directly
+    give TP/FP counts for "threshold = this example's score". We keep only
+    one point per *distinct* score -- ties must move together, since no
+    threshold value can separate two examples with equal scores -- and
+    prepend (0, 0) for the "threshold = +infinity, reject everything"
+    endpoint.
+    """
+    y_true = np.asarray(y_true)
+    order = np.argsort(-np.asarray(y_scores))
+    y_true_sorted = y_true[order]
+    scores_sorted = np.asarray(y_scores, dtype=float)[order]
+
+    total_positives = y_true_sorted.sum()
+    total_negatives = len(y_true_sorted) - total_positives
+    if total_positives == 0 or total_negatives == 0:
+        raise ValueError("roc_curve needs at least one positive and one negative example")
+
+    tps = np.cumsum(y_true_sorted)         # running true-positive count
+    fps = np.cumsum(1 - y_true_sorted)     # running false-positive count
+
+    # Keep only the last index of each run of tied scores (a threshold can
+    # only be drawn *between* distinct score values, not inside a tie).
+    distinct = np.where(np.diff(scores_sorted, append=np.nan) != 0)[0]
+
+    tpr = tps[distinct] / total_positives
+    fpr = fps[distinct] / total_negatives
+    thresholds = scores_sorted[distinct]
+
+    # Prepend the (0, 0) point for the "reject everything" threshold.
+    fpr = np.concatenate(([0.0], fpr))
+    tpr = np.concatenate(([0.0], tpr))
+    return fpr, tpr, thresholds
+
+
+def auc_roc(y_true, y_scores):
+    """Area Under the ROC Curve (AUC), via the trapezoidal rule over the
+    curve produced by roc_curve(). Ranges from 0.5 (no better than random
+    guessing) to 1.0 (perfect ranking of positives above negatives); below
+    0.5 means the scores are anti-correlated with the labels (flipping the
+    classifier's sign would beat it).
+    """
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    # fpr is non-decreasing by construction (sorted by threshold), so this
+    # is a valid left-to-right trapezoidal integration of tpr d(fpr): each
+    # segment's area is its width (change in fpr) times the average of
+    # its two endpoint heights (tpr values).
+    widths = np.diff(fpr)
+    avg_heights = (tpr[1:] + tpr[:-1]) / 2
+    return float(np.sum(widths * avg_heights))
+
+
+def auc_roc_rank_based(y_true, y_scores):
+    """Alternate O(n log n) computation of AUC using its probabilistic
+    definition: AUC = P(score of a random positive > score of a random
+    negative), with ties counted as half a "win". This is the (normalized)
+    Mann-Whitney U statistic, and gives the same value as integrating the
+    ROC curve -- useful as a cross-check, and a common alternate way this
+    metric is asked for in interviews ("compute AUC without building a
+    curve").
+
+    Algorithm: rank all n = P + N scores together, giving tied scores the
+    *average* rank of the positions they span (required for an unbiased
+    result under ties). Sum the ranks landing on positive examples. If
+    positives always ranked below negatives, that sum would be minimized
+    at 1+2+...+P = P*(P+1)/2; subtracting that baseline and normalizing by
+    the total number of positive-negative pairs (P*N) gives exactly the
+    fraction of pairs where the positive outranks the negative.
+    """
+    y_true = np.asarray(y_true)
+    scores = np.asarray(y_scores, dtype=float)
+    total_positives = y_true.sum()
+    total_negatives = len(y_true) - total_positives
+    if total_positives == 0 or total_negatives == 0:
+        raise ValueError("auc_roc_rank_based needs at least one positive and one negative example")
+
+    # Average ranks (1-indexed): walk the ascending-sorted scores in runs
+    # of equal value, assigning every member of a run the mean rank of
+    # the positions that run occupies.
+    order = np.argsort(scores)
+    sorted_scores = scores[order]
+    ranks = np.empty(len(scores))
+    i = 0
+    while i < len(sorted_scores):
+        j = i
+        while j + 1 < len(sorted_scores) and sorted_scores[j + 1] == sorted_scores[i]:
+            j += 1
+        avg_rank = (i + j) / 2 + 1  # +1 because ranks are 1-indexed
+        ranks[order[i:j + 1]] = avg_rank
+        i = j + 1
+
+    rank_sum_positive = ranks[y_true == 1].sum()
+    return float((rank_sum_positive - total_positives * (total_positives + 1) / 2) /
+                 (total_positives * total_negatives))
+
+
+def confusion_matrix_counts(y_true, y_pred):
+    """The four counts (TP/FP/TN/FN) that every point-metric below
+    (accuracy, precision, recall, F1) is built from, for binary
+    true/predicted labels.
+        TP: predicted positive, actually positive
+        FP: predicted positive, actually negative  (a "false alarm")
+        TN: predicted negative, actually negative
+        FN: predicted negative, actually positive  (a "miss")
+    """
+    y_true = np.asarray(y_true).astype(bool)
+    y_pred = np.asarray(y_pred).astype(bool)
+    return {
+        "tp": int(np.sum(y_true & y_pred)),
+        "fp": int(np.sum(~y_true & y_pred)),
+        "tn": int(np.sum(~y_true & ~y_pred)),
+        "fn": int(np.sum(y_true & ~y_pred)),
+    }
+
+
+def classification_metrics(y_true, y_pred):
+    """Standard point-metrics for a classifier at a single, already-fixed
+    threshold (i.e. after scores have been turned into hard 0/1
+    predictions), all derived from the confusion matrix:
+        accuracy  = (TP+TN) / total        -- overall fraction correct
+        precision = TP / (TP+FP)           -- of predicted positives, how many are right
+        recall    = TP / (TP+FN)           -- of actual positives, how many did we find
+        f1        = 2 * P * R / (P + R)    -- harmonic mean of precision & recall
+    Precision and recall trade off against each other as the threshold
+    moves (that's exactly what average_precision/roc_curve sweep over);
+    F1 collapses that trade-off into one number at one specific threshold,
+    and the harmonic mean (vs. a plain average) punishes having one of the
+    two be very low even if the other is high.
+    """
+    counts = confusion_matrix_counts(y_true, y_pred)
+    tp, fp, tn, fn = counts["tp"], counts["fp"], counts["tn"], counts["fn"]
+    total = tp + fp + tn + fn
+
+    accuracy = (tp + tn) / total if total else 0.0
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, **counts}
+
+
 def jaccard_similarity(a, b):
     """Jaccard similarity for two sets: |intersection| / |union|.
     Ranges from 0 (disjoint) to 1 (identical sets). Two empty sets are
@@ -179,6 +335,41 @@ if __name__ == "__main__":
     ap = average_precision([1, 0, 1, 1, 0], [0.9, 0.8, 0.7, 0.4, 0.3])
     assert 0 <= ap <= 1
     print("average_precision OK", ap)
+
+    # Perfectly separable case (both positive scores rank above both
+    # negative scores) -> AUC should be exactly 1.0 under every method.
+    y_true_perfect = [1, 1, 0, 0]
+    y_scores_perfect = [0.9, 0.4, 0.35, 0.1]
+    fpr, tpr, _ = roc_curve(y_true_perfect, y_scores_perfect)
+    assert np.allclose(fpr, [0.0, 0.0, 0.0, 0.5, 1.0])
+    assert np.allclose(tpr, [0.0, 0.5, 1.0, 1.0, 1.0])
+    print("roc_curve OK")
+
+    auc_trap = auc_roc(y_true_perfect, y_scores_perfect)
+    auc_rank = auc_roc_rank_based(y_true_perfect, y_scores_perfect)
+    assert abs(auc_trap - 1.0) < 1e-9
+    # Both implementations of AUC must agree with each other on any input,
+    # not just this perfect-separation case -- that's the whole point of
+    # having a cross-check implementation.
+    assert abs(auc_trap - auc_rank) < 1e-9
+    print("auc_roc / auc_roc_rank_based OK", auc_trap)
+
+    # A worse-than-random case: negatives score higher than positives, so
+    # a random positive beats a random negative 0 times out of 4 -> AUC 0.
+    y_true_inverted = [1, 1, 0, 0]
+    y_scores_inverted = [0.1, 0.2, 0.8, 0.9]
+    assert abs(auc_roc(y_true_inverted, y_scores_inverted) - 0.0) < 1e-9
+    assert abs(auc_roc_rank_based(y_true_inverted, y_scores_inverted) - 0.0) < 1e-9
+    print("auc_roc inverted-ranking OK")
+
+    counts = confusion_matrix_counts([1, 0, 1, 1, 0, 0], [1, 0, 0, 1, 1, 0])
+    assert counts == {"tp": 2, "fp": 1, "tn": 2, "fn": 1}
+    metrics = classification_metrics([1, 0, 1, 1, 0, 0], [1, 0, 0, 1, 1, 0])
+    assert abs(metrics["accuracy"] - 4 / 6) < 1e-9
+    assert abs(metrics["precision"] - 2 / 3) < 1e-9
+    assert abs(metrics["recall"] - 2 / 3) < 1e-9
+    assert abs(metrics["f1"] - 2 / 3) < 1e-9
+    print("confusion_matrix_counts / classification_metrics OK", metrics)
 
     assert jaccard_similarity({1, 2, 3}, {2, 3, 4}) == 0.5
     assert abs(weighted_jaccard_similarity([1, 2, 0], [1, 0, 3]) - (1 / 6)) < 1e-9
