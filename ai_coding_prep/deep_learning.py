@@ -1,4 +1,5 @@
-"""Deep learning primitives: batch norm, 1D convolution, attention, beam search."""
+"""Deep learning primitives: batch norm, 1D convolution, activations
+(sigmoid, ReLU), attention, beam search."""
 
 import numpy as np
 
@@ -88,6 +89,102 @@ def conv1d(x, kernel, stride=1, padding=0):
         # Dot product of kernel with the current window -> one output value.
         out[i] = np.dot(x[start:start + k], kernel)
     return out
+
+
+def sigmoid(x):
+    """Sigmoid (logistic) activation: squashes any real number into (0, 1).
+
+        sigmoid(x) = 1 / (1 + e^-x)
+
+    Model: historically used as the activation in early neural nets, and
+    still used today wherever you want an output interpretable as a
+    probability or a "gate" (e.g. binary classification output, LSTM/GRU
+    gates). It's monotonic, smooth, and symmetric around x=0 -> 0.5.
+
+    Numerical stability: computing e^-x directly overflows for very
+    negative x (e.g. x = -1000 makes e^-x astronomically large) and, less
+    obviously, computing e^x directly overflows for very positive x. The
+    standard fix is to pick whichever of the two equivalent forms keeps
+    the exponent's argument negative:
+        for x >= 0:  1 / (1 + e^-x)      (e^-x is small and safe)
+        for x <  0:  e^x / (1 + e^x)     (e^x is small and safe; this is
+                                           algebraically the same function,
+                                           just multiplying top and bottom
+                                           of the first form by e^x)
+
+    Known weakness (why ReLU below is often preferred in deep nets): the
+    derivative sigmoid(x)*(1-sigmoid(x)) maxes out at 0.25 (at x=0) and
+    shrinks toward 0 as |x| grows -- so in deep stacks of sigmoid layers,
+    gradients shrink multiplicatively at every layer during backprop
+    ("vanishing gradients"), slowing or stalling learning in early layers.
+    """
+    x = np.asarray(x, dtype=float)
+    out = np.empty_like(x)
+
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))     # safe: exponent is <= 0
+
+    neg = ~pos
+    exp_x = np.exp(x[neg])                       # safe: exponent is < 0
+    out[neg] = exp_x / (1.0 + exp_x)
+
+    return out
+
+
+def sigmoid_backward(dout, sigmoid_out):
+    """Backward pass for sigmoid, given dL/d(sigmoid_out) and the cached
+    forward output (not the raw input -- the derivative is naturally
+    expressed in terms of the output itself, which is why forward passes
+    typically cache their output for later reuse here):
+
+        d(sigmoid(x))/dx = sigmoid(x) * (1 - sigmoid(x))
+
+    Quick derivation: let s = 1/(1+e^-x). Using the quotient rule,
+    ds/dx = e^-x / (1+e^-x)^2 = [1/(1+e^-x)] * [e^-x/(1+e^-x)]
+           = s * (1 - s)          (since 1 - s = e^-x / (1+e^-x)).
+    """
+    return dout * sigmoid_out * (1.0 - sigmoid_out)
+
+
+def relu(x):
+    """ReLU (Rectified Linear Unit): the default activation in most modern
+    deep nets.
+
+        relu(x) = max(0, x)
+
+    Model: pass positive values through unchanged, zero out negative
+    values. It's the identity function on the positive side, which is
+    exactly why it largely avoids the vanishing-gradient problem sigmoid
+    has -- the gradient there is a constant 1, not something that shrinks
+    with |x|. It's also far cheaper to compute (one comparison) than an
+    exponential.
+
+    Known weakness ("dying ReLU"): if a unit's input is negative, its
+    gradient is exactly 0, so that unit gets zero learning signal and its
+    weights never update on that example -- if this happens persistently
+    across training, the unit can become permanently inactive. (Variants
+    like Leaky ReLU address this by letting a small gradient leak through
+    for x < 0; not implemented here.)
+    """
+    return np.maximum(0.0, x)
+
+
+def relu_backward(dout, x):
+    """Backward pass for ReLU, given dL/d(relu(x)) and the cached forward
+    *input* x (unlike sigmoid, ReLU's derivative depends on which side of
+    0 the original input was, not on the output value):
+
+        d(relu(x))/dx = 1  if x > 0
+                       = 0  if x < 0
+                       = undefined at x = 0 (a measure-zero case in
+                         practice; frameworks conventionally treat it as 0,
+                         which is what the strict `x > 0` mask below does)
+
+    So the gradient either passes through unchanged (x > 0) or gets
+    zeroed out entirely (x <= 0) -- there's no "shrinking," just an
+    on/off gate, which is what makes ReLU cheap to backprop through too.
+    """
+    return dout * (x > 0)
 
 
 def scaled_dot_product_attention(Q, K, V, mask=None):
@@ -197,6 +294,21 @@ if __name__ == "__main__":
     result = conv1d(signal, kernel)
     assert np.allclose(result, [-2.0, -2.0, -2.0])
     print("conv1d OK", result)
+
+    assert np.isclose(sigmoid(np.array([0.0]))[0], 0.5)         # symmetric midpoint
+    assert np.allclose(sigmoid(np.array([1000.0, -1000.0])), [1.0, 0.0])  # no overflow
+    s = sigmoid(np.array([-2.0, 0.0, 2.0]))
+    assert np.all(np.diff(s) > 0)   # sigmoid is strictly increasing
+    ds_numerical = (sigmoid(np.array([0.0]) + 1e-5) - sigmoid(np.array([0.0]) - 1e-5)) / (2e-5)
+    assert np.isclose(sigmoid_backward(1.0, sigmoid(np.array([0.0])))[0], ds_numerical[0], atol=1e-4)
+    print("sigmoid / sigmoid_backward OK", s)
+
+    r_input = np.array([-2.0, -0.5, 0.0, 0.5, 2.0])
+    r = relu(r_input)
+    assert np.array_equal(r, [0.0, 0.0, 0.0, 0.5, 2.0])
+    dr = relu_backward(np.ones_like(r_input), r_input)
+    assert np.array_equal(dr, [0.0, 0.0, 0.0, 1.0, 1.0])
+    print("relu / relu_backward OK", r, dr)
 
     Q = K = V = np.eye(3)   # identity Q/K/V -> each query attends to itself
     out, weights = scaled_dot_product_attention(Q, K, V)
