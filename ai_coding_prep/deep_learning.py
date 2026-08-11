@@ -1,5 +1,8 @@
 """Deep learning primitives: batch norm, 1D convolution, activations
-(sigmoid, ReLU), attention, beam search."""
+(sigmoid, ReLU), a two-layer MLP forward/backward pass, attention, beam
+search."""
+
+from typing import List
 
 import numpy as np
 
@@ -187,6 +190,115 @@ def relu_backward(dout, x):
     return dout * (x > 0)
 
 
+class TwoLayerMLP:
+    """Two-layer MLP forward and backward pass, backprop derived and coded
+    by hand (no autodiff): x -> Linear(W1, b1) -> ReLU -> Linear(W2, b2)
+    -> y_pred, trained against Mean Squared Error loss.
+
+    This is the smallest network that still needs the full machinery of
+    backprop: two layers of chain rule, a nonlinearity to differentiate
+    through, and a shared computation graph where the hidden layer's
+    output feeds every output unit (so its gradient has to sum
+    contributions from all of them).
+
+    Forward pass:
+        z1_pre = W1 @ x + b1            # hidden pre-activation, shape (hidden,)
+        z1     = relu(z1_pre)           # hidden activation, shape (hidden,)
+        y_pred = W2 @ z1 + b2           # output, shape (output,)
+        loss   = mean((y_pred - y_true)^2)
+
+    Backward pass -- walk the forward pass in reverse, at each step
+    computing "how much does the loss change if I nudge *this*
+    quantity," using the chain rule to turn the previous step's answer
+    into the next one:
+        d_y_pred  = 2*(y_pred - y_true) / n     # dL/d(y_pred), n = len(y_true)
+        dW2       = outer(d_y_pred, z1)         # dL/dW2
+        db2       = d_y_pred                    # dL/db2
+        d_z1      = W2.T @ d_y_pred              # dL/dz1 (error routed back through W2)
+        d_z1_pre  = d_z1 * (z1_pre > 0)          # dL/d(z1_pre), ReLU backward
+        dW1       = outer(d_z1_pre, x)           # dL/dW1
+        db1       = d_z1_pre                     # dL/db1
+
+    Why outer products for the weight gradients: for any linear layer
+    `out = W @ in + b`, out[i] = sum_j W[i][j]*in[j] + b[i], so
+    d(out[i])/d(W[i][j]) = in[j] -- meaning dL/dW[i][j] = d_out[i] * in[j]
+    for *every* (i, j) pair simultaneously, which is exactly the
+    definition of np.outer(d_out, in): a matrix whose [i][j] entry is
+    d_out[i] * in[j].
+
+    Why W2.T for the hidden-layer gradient: forward, W2 routes hidden
+    units to outputs (hidden -> output). Backward, the same connections
+    carry the error signal the opposite way (output -> hidden), which is
+    exactly what transposing the weight matrix does: W2.T[j][i] =
+    W2[i][j], so (W2.T @ d_y_pred)[j] sums, over every output i, how much
+    of output i's error flowed in through the connection from hidden
+    unit j -- i.e. every path by which nudging z1[j] could affect the
+    loss, added together (multivariable chain rule: when one quantity
+    influences several downstream outputs, its total gradient is the sum
+    of its gradient through each of them).
+    """
+
+    def forward_and_backward(
+        self,
+        x: List[float],
+        W1: List[List[float]], b1: List[float],
+        W2: List[List[float]], b2: List[float],
+        y_true: List[float],
+    ) -> dict:
+        x = np.array(x, dtype=float)
+        W1, b1 = np.array(W1, dtype=float), np.array(b1, dtype=float)
+        W2, b2 = np.array(W2, dtype=float), np.array(b2, dtype=float)
+        y_true = np.array(y_true, dtype=float)
+
+        # --- Forward pass ---
+        # Keep z1_pre (before ReLU) around separately from z1 (after
+        # ReLU): the backward pass needs to know *where* the ReLU zeroed
+        # things out, which only z1_pre's sign can tell you -- z1 alone
+        # can't distinguish "input was exactly 0" from "input was very
+        # negative," both of which look like 0 after the max().
+        z1_pre = W1 @ x + b1          # hidden pre-activation, shape (hidden,)
+        z1 = relu(z1_pre)             # ReLU activation, shape (hidden,)
+        y_pred = W2 @ z1 + b2         # network output, shape (output,)
+
+        n = y_true.shape[0]
+        loss = np.mean((y_pred - y_true) ** 2)
+
+        # --- Backward pass (mirror the forward pass, last op first) ---
+        # d(mean((y_pred - y_true)^2))/d(y_pred[i]) = 2*(y_pred[i] - y_true[i])/n
+        # -- each output only appears in its own term of the mean, so
+        # every entry's gradient depends only on itself, no cross terms.
+        d_y_pred = 2.0 * (y_pred - y_true) / n
+
+        # Output layer (y_pred = W2 @ z1 + b2): weight gradient is the
+        # outer product of this layer's upstream gradient and its input
+        # (z1); bias gradient is just the upstream gradient itself, since
+        # d(out)/d(b) = 1.
+        dW2 = np.outer(d_y_pred, z1)
+        db2 = d_y_pred.copy()
+
+        # Route the error backward through W2 to get the gradient at the
+        # hidden layer's *output* (post-ReLU) -- reusing this file's own
+        # relu_backward to then push it through ReLU into the gradient at
+        # the hidden layer's *pre-activation*.
+        d_z1 = W2.T @ d_y_pred
+        d_z1_pre = relu_backward(d_z1, z1_pre)
+
+        # Hidden layer (z1_pre = W1 @ x + b1): identical outer-product
+        # pattern to the output layer, just one layer deeper -- this is
+        # the general shape of backprop through any stack of linear
+        # layers, repeated once per layer.
+        dW1 = np.outer(d_z1_pre, x)
+        db1 = d_z1_pre.copy()
+
+        return {
+            "loss": round(float(loss), 4),
+            "dW1": np.round(dW1, 4).tolist(),
+            "db1": np.round(db1, 4).tolist(),
+            "dW2": np.round(dW2, 4).tolist(),
+            "db2": np.round(db2, 4).tolist(),
+        }
+
+
 def scaled_dot_product_attention(Q, K, V, mask=None):
     """Scaled dot-product attention, the core of the Transformer
     (Vaswani et al., 2017): "Attention is All You Need".
@@ -309,6 +421,59 @@ if __name__ == "__main__":
     dr = relu_backward(np.ones_like(r_input), r_input)
     assert np.array_equal(dr, [0.0, 0.0, 0.0, 1.0, 1.0])
     print("relu / relu_backward OK", r, dr)
+
+    mlp = TwoLayerMLP()
+    x_mlp = [1.0, -2.0, 0.5]
+    W1_mlp = [[0.5, -1.0, 0.2], [0.3, 0.1, -0.4]]   # hidden=2, input=3
+    b1_mlp = [0.1, -0.2]
+    W2_mlp = [[1.0, -1.0], [0.5, 0.5]]              # output=2, hidden=2
+    b2_mlp = [0.0, 0.1]
+    y_true_mlp = [1.0, 0.5]
+
+    result = mlp.forward_and_backward(x_mlp, W1_mlp, b1_mlp, W2_mlp, b2_mlp, y_true_mlp)
+    assert set(result.keys()) == {"loss", "dW1", "db1", "dW2", "db2"}
+
+    # Numerical gradient check: hold every parameter fixed except the one
+    # array being tested, perturb each of its entries by +-eps, recompute
+    # the (unrounded) loss, and estimate that entry's gradient via a
+    # central difference. This must match the hand-derived analytic
+    # gradients above to confirm the backward pass is actually correct,
+    # not just plausible-looking -- the same technique used for
+    # batch_norm_backward's dgamma check earlier in this file.
+    W1_arr = np.array(W1_mlp, dtype=float)
+    b1_arr = np.array(b1_mlp, dtype=float)
+    W2_arr = np.array(W2_mlp, dtype=float)
+    b2_arr = np.array(b2_mlp, dtype=float)
+    x_arr = np.array(x_mlp, dtype=float)
+    y_true_arr = np.array(y_true_mlp, dtype=float)
+
+    def mlp_loss(W1, b1, W2, b2):
+        z1 = relu(W1 @ x_arr + b1)
+        y_pred = W2 @ z1 + b2
+        return np.mean((y_pred - y_true_arr) ** 2)
+
+    def numerical_gradient(param, loss_fn, eps=1e-5):
+        grad = np.zeros_like(param)
+        for idx in np.ndindex(param.shape):
+            original = param[idx]
+            param[idx] = original + eps
+            loss_plus = loss_fn()
+            param[idx] = original - eps
+            loss_minus = loss_fn()
+            param[idx] = original   # restore before moving to the next entry
+            grad[idx] = (loss_plus - loss_minus) / (2 * eps)
+        return grad
+
+    numerical_dW1 = numerical_gradient(W1_arr, lambda: mlp_loss(W1_arr, b1_arr, W2_arr, b2_arr))
+    numerical_db1 = numerical_gradient(b1_arr, lambda: mlp_loss(W1_arr, b1_arr, W2_arr, b2_arr))
+    numerical_dW2 = numerical_gradient(W2_arr, lambda: mlp_loss(W1_arr, b1_arr, W2_arr, b2_arr))
+    numerical_db2 = numerical_gradient(b2_arr, lambda: mlp_loss(W1_arr, b1_arr, W2_arr, b2_arr))
+
+    assert np.allclose(result["dW1"], numerical_dW1, atol=1e-4)
+    assert np.allclose(result["db1"], numerical_db1, atol=1e-4)
+    assert np.allclose(result["dW2"], numerical_dW2, atol=1e-4)
+    assert np.allclose(result["db2"], numerical_db2, atol=1e-4)
+    print("TwoLayerMLP.forward_and_backward OK", result)
 
     Q = K = V = np.eye(3)   # identity Q/K/V -> each query attends to itself
     out, weights = scaled_dot_product_attention(Q, K, V)
