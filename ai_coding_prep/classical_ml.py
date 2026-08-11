@@ -1,8 +1,9 @@
-"""Classical ML: k-means, perceptron, and binary-classifier evaluation
-metrics (average precision, ROC/AUC, confusion-matrix metrics, Jaccard
-similarity)."""
+"""Classical ML: k-means, perceptron, linear regression (batch gradient
+descent), and binary-classifier evaluation metrics (average precision,
+ROC/AUC, confusion-matrix metrics, Jaccard similarity)."""
 
 import numpy as np
+from numpy.typing import NDArray
 
 
 def kmeans(X, k, max_iters=100, tol=1e-4, seed=None):
@@ -100,6 +101,106 @@ class Perceptron:
             if errors == 0:
                 break
         return self
+
+
+class Solution:
+    """Linear regression trained by batch gradient descent on MSE loss.
+    (Class/method names kept as `Solution`/`get_derivative`/
+    `get_model_prediction`/`train_model` to match the interview-style
+    interface this was adapted from.)
+
+    Model: y_hat = X @ w  (no implicit intercept -- include a constant
+    column of 1s in X yourself if you want a bias term).
+
+    Loss (Mean Squared Error): L(w) = (1/N) * sum_i (y_i - y_hat_i)^2
+
+    Gradient: differentiate L w.r.t. a single weight w_j. Since
+    y_hat_i = sum_k X_ik * w_k, we get d(y_hat_i)/d(w_j) = X_ij, so by the
+    chain rule:
+        dL/dw_j = (1/N) * sum_i 2*(y_i - y_hat_i) * (-X_ij)
+                = -(2/N) * X[:, j] . (y - y_hat)
+    Stacking that over every weight at once gives the full gradient
+    vector in one matrix expression:
+        grad = -(2/N) * X.T @ (y - y_hat)
+
+    Training is batch gradient descent: repeatedly step opposite the
+    gradient (the direction of steepest loss *increase*), scaled by
+    `learning_rate`:
+        w <- w - learning_rate * grad
+    "Batch" means every step uses the *entire* dataset (as opposed to a
+    single example or a random mini-batch, as in true SGD) -- so each
+    step is an exact gradient step on the true MSE loss, at the cost of
+    O(N) work per step.
+    """
+
+    def __init__(self, learning_rate: float = 0.01):
+        self.learning_rate = learning_rate
+
+    def get_model_prediction(self, X: NDArray[np.float64], weights: NDArray[np.float64]) -> NDArray[np.float64]:
+        """y_hat = X @ w, flattened to a 1D array of per-example predictions.
+
+        `reshape(-1)` is used instead of the original `np.squeeze`
+        deliberately: squeeze drops *every* size-1 axis, which silently
+        collapses the batch axis too when N == 1 (a (1, 1) prediction
+        would become a 0-d scalar instead of a length-1 vector).
+        reshape(-1) always flattens to 1D regardless of N, matching what
+        every caller here expects.
+        """
+        predictions = X @ weights
+        return predictions.reshape(-1)
+
+    def get_derivative(
+        self,
+        model_prediction: NDArray[np.float64],
+        ground_truth: NDArray[np.float64],
+        N: int,
+        X: NDArray[np.float64],
+        desired_weight: int,
+    ) -> float:
+        """dL/d(weights[desired_weight]) for the MSE loss above.
+        (N is just len(X); kept as an explicit parameter so this method
+        matches the required interface rather than recomputing it.)
+        """
+        return -2.0 * np.dot(ground_truth - model_prediction, X[:, desired_weight]) / N
+
+    def train_model(
+        self,
+        X: NDArray[np.float64],
+        Y: NDArray[np.float64],
+        num_iterations: int,
+        initial_weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Run `num_iterations` steps of batch gradient descent starting
+        from `initial_weights`, and return the final weights rounded to 5
+        decimal places.
+
+        Bug fixes vs. the original: the original aliased
+        `weights = initial_weights` and updated it with in-place
+        `weights[i] -= ...`, which (a) silently mutates the caller's
+        array as a side effect, and (b) raises a numpy casting error if
+        `initial_weights` has an integer dtype (in-place subtraction
+        can't write a float result into an int array under numpy's
+        "same_kind" casting rule). Copying into a fresh float64 array up
+        front avoids both.
+        """
+        weights = np.array(initial_weights, dtype=np.float64, copy=True)
+        N = X.shape[0]
+
+        for _ in range(num_iterations):
+            y_pred = self.get_model_prediction(X, weights)
+
+            # Mathematically identical to calling get_derivative(...) for
+            # every weight index j and collecting the results into an
+            # array (get_derivative is kept above so each per-weight
+            # gradient can still be inspected/tested individually), but
+            # computed here as a single matrix-vector product instead of
+            # `d` separate Python-level dot products -- one BLAS call
+            # instead of d of them.
+            gradient = -2.0 * (X.T @ (Y - y_pred)) / N
+
+            weights -= self.learning_rate * gradient
+
+        return np.round(weights, 5)
 
 
 def average_precision(y_true, y_scores):
@@ -331,6 +432,40 @@ if __name__ == "__main__":
     clf = Perceptron(n_features=2).fit(X_lin, y_lin)
     assert all(clf.predict(x) == y for x, y in zip(X_lin, y_lin))
     print("perceptron OK")
+
+    # Noiseless linear regression: with enough well-conditioned data and
+    # iterations, batch gradient descent should recover the true weights
+    # to (near-)exact precision.
+    X_reg = rng.normal(size=(200, 2))
+    true_weights = np.array([3.0, -2.0])
+    Y_reg = X_reg @ true_weights
+
+    sol = Solution(learning_rate=0.1)
+    initial_weights = np.zeros(2)
+    learned_weights = sol.train_model(X_reg, Y_reg, num_iterations=1000, initial_weights=initial_weights)
+    assert np.allclose(learned_weights, true_weights, atol=1e-4)
+    assert np.array_equal(initial_weights, [0.0, 0.0])  # caller's array must not be mutated
+    print("Solution.train_model (linear regression) OK", learned_weights)
+
+    # get_derivative (single-weight gradient) must agree with the
+    # vectorized gradient train_model actually uses internally.
+    y_pred = sol.get_model_prediction(X_reg, learned_weights)
+    vectorized_grad = -2.0 * (X_reg.T @ (Y_reg - y_pred)) / X_reg.shape[0]
+    for j in range(2):
+        assert np.isclose(sol.get_derivative(y_pred, Y_reg, X_reg.shape[0], X_reg, j), vectorized_grad[j])
+    print("Solution.get_derivative OK")
+
+    # N=1 edge case: prediction must stay a 1D length-1 array, not
+    # collapse into a 0-d scalar (the np.squeeze bug this replaced).
+    pred_single = sol.get_model_prediction(np.array([[2.0, 3.0]]), np.array([1.0, 1.0]))
+    assert pred_single.shape == (1,)
+    print("Solution.get_model_prediction N=1 OK", pred_single)
+
+    # Integer initial_weights must not crash (the original's in-place
+    # `weights[i] -= float_grad` raised a numpy casting error here).
+    int_weights = np.array([0, 0])
+    sol.train_model(np.array([[1.0, 2.0], [3.0, 4.0]]), np.array([5.0, 11.0]), 5, int_weights)
+    print("Solution.train_model integer-dtype input OK")
 
     ap = average_precision([1, 0, 1, 1, 0], [0.9, 0.8, 0.7, 0.4, 0.3])
     assert 0 <= ap <= 1
