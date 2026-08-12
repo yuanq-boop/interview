@@ -1,6 +1,8 @@
 """Classical ML: k-means, perceptron, linear regression (batch gradient
-descent), and binary-classifier evaluation metrics (average precision,
-ROC/AUC, confusion-matrix metrics, Jaccard similarity)."""
+descent), binary-classifier evaluation metrics (average precision,
+ROC/AUC, confusion-matrix metrics, Jaccard similarity), and
+information-theoretic / loss functions (entropy, cross-entropy, KL and
+JS divergence, binary cross-entropy)."""
 
 import numpy as np
 from numpy.typing import NDArray
@@ -393,6 +395,116 @@ def classification_metrics(y_true, y_pred):
     return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, **counts}
 
 
+def entropy(p, base=np.e):
+    """Shannon entropy: H(p) = -sum_i p_i * log(p_i).
+
+    Measures the average "surprise"/uncertainty of a distribution `p`:
+    it's the theoretical lower bound on the average number of nats (or
+    bits, if base=2) needed to encode samples drawn from `p` using an
+    optimal code built specifically for `p`. A distribution concentrated
+    on one outcome has entropy 0 (no surprise, you already know the
+    answer); the uniform distribution over n outcomes has the *maximum*
+    possible entropy (log(n)) -- maximal uncertainty.
+
+    Convention: 0 * log(0) is treated as 0 (its limit as p_i -> 0+),
+    rather than the log(0) = -inf that would otherwise appear -- an
+    outcome that never happens contributes no uncertainty.
+    """
+    p = np.asarray(p, dtype=float)
+    mask = p > 0   # skip zero-probability terms per the 0*log(0)=0 convention
+    h_nats = -np.sum(p[mask] * np.log(p[mask]))
+    return float(h_nats / np.log(base))   # convert from nats to the requested base
+
+
+def cross_entropy(p, q, base=np.e):
+    """Cross-entropy: H(p, q) = -sum_i p_i * log(q_i).
+
+    The average number of nats needed to encode samples from the *true*
+    distribution `p`, using a code built for a (possibly wrong) model
+    distribution `q`. This is exactly why it's used as a training loss:
+    with `p` = the one-hot true label and `q` = the model's predicted
+    distribution, H(p, q) is minimized (down to the irreducible
+    entropy(p), which is 0 for a one-hot `p`) precisely when `q` matches
+    `p` -- so minimizing cross-entropy pushes predictions toward the
+    truth.
+
+    Diverges to +inf if `q` assigns zero probability to any outcome `p`
+    considers possible (log(0) = -inf, times a positive p_i) -- that's
+    the correct math: a code built assuming that outcome is impossible
+    needs infinitely many bits to encode it if it happens anyway. This
+    is why practical training losses usually clip/smooth `q` away from
+    exactly 0 (see binary_cross_entropy below).
+    """
+    p, q = np.asarray(p, dtype=float), np.asarray(q, dtype=float)
+    mask = p > 0
+    h_nats = -np.sum(p[mask] * np.log(q[mask]))
+    return float(h_nats / np.log(base))
+
+
+def kl_divergence(p, q, base=np.e):
+    """Kullback-Leibler divergence: D_KL(p || q) = sum_i p_i*log(p_i/q_i)
+                                                  = cross_entropy(p, q) - entropy(p)
+
+    The *extra* nats wasted by using a code built for `q` instead of the
+    optimal code for `p`, beyond the unavoidable entropy(p) nats you'd
+    need either way -- i.e. purely "the cost of q being wrong," with the
+    inherent uncertainty of p subtracted out.
+
+    Properties: D_KL(p||q) >= 0 always (Gibbs' inequality), with equality
+    iff p == q exactly. It is NOT symmetric in general
+    (D_KL(p||q) != D_KL(q||p)) -- it's a directional measure of "how bad
+    is q as a stand-in for p," not a true distance/metric.
+    """
+    return cross_entropy(p, q, base) - entropy(p, base)
+
+
+def js_divergence(p, q, base=np.e):
+    """Jensen-Shannon divergence: a symmetrized, always-finite smoothing
+    of KL divergence, built from the average of the two distributions
+    m = (p + q) / 2:
+        JSD(p, q) = 0.5 * KL(p || m) + 0.5 * KL(q || m)
+
+    Unlike raw KL, JSD is symmetric (JSD(p, q) == JSD(q, p) by
+    construction) and bounded (0 <= JSD <= log(2) in nats, or <= 1 in
+    bits), and it never diverges to infinity even when p and q have
+    completely disjoint support -- because m = (p+q)/2 always has
+    positive probability everywhere either p or q does, so neither
+    KL(p||m) nor KL(q||m) can hit a log(0).
+    """
+    p, q = np.asarray(p, dtype=float), np.asarray(q, dtype=float)
+    m = 0.5 * (p + q)
+    return 0.5 * kl_divergence(p, m, base) + 0.5 * kl_divergence(q, m, base)
+
+
+def binary_cross_entropy(y_true, y_pred):
+    """Binary cross-entropy (a.k.a. log loss): the per-example
+    cross-entropy between the true label -- viewed as the degenerate
+    two-outcome distribution [1-y, y] -- and the model's predicted
+    probability of the positive class, averaged over all examples:
+        BCE = -mean_i( y_i*log(p_i) + (1-y_i)*log(1-p_i) )
+
+    This is the standard training loss for logistic regression / binary
+    classifiers: it's the *training-time* counterpart to the
+    *evaluation-time* metrics above (average_precision, auc_roc,
+    classification_metrics) -- those measure how good a trained
+    classifier's rankings/decisions are, while this is what you'd
+    actually differentiate and minimize to get there, since (unlike
+    accuracy) it's smooth and has a useful gradient everywhere.
+
+    Predictions are clipped away from exactly 0 or 1 before taking the
+    log, since a genuinely wrong confident prediction (y=1, p=0 or
+    y=0, p=1) would otherwise make this diverge to +inf -- a real risk
+    in practice, unlike the pure-math entropy/cross_entropy/kl_divergence
+    above, which are left free to diverge since they're meant to
+    represent the exact theoretical quantities.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    eps = 1e-12
+    y_pred = np.clip(y_pred, eps, 1 - eps)
+    return float(-np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)))
+
+
 def jaccard_similarity(a, b):
     """Jaccard similarity for two sets: |intersection| / |union|.
     Ranges from 0 (disjoint) to 1 (identical sets). Two empty sets are
@@ -505,6 +617,46 @@ if __name__ == "__main__":
     assert abs(metrics["recall"] - 2 / 3) < 1e-9
     assert abs(metrics["f1"] - 2 / 3) < 1e-9
     print("confusion_matrix_counts / classification_metrics OK", metrics)
+
+    # A fair coin has exactly 1 bit of entropy; a certain outcome has 0.
+    assert np.isclose(entropy([0.5, 0.5], base=2), 1.0)
+    assert np.isclose(entropy([1.0, 0.0]), 0.0)
+    print("entropy OK")
+
+    # H(p, p) == H(p) exactly (cross-entropy of a distribution with
+    # itself is just its own entropy), so KL(p||p) == 0.
+    p_dist = np.array([0.7, 0.2, 0.1])
+    assert np.isclose(cross_entropy(p_dist, p_dist), entropy(p_dist))
+    assert np.isclose(kl_divergence(p_dist, p_dist), 0.0, atol=1e-9)
+    print("cross_entropy / kl_divergence (self-comparison) OK")
+
+    # Gibbs' inequality (KL >= 0) and asymmetry (KL(p||q) != KL(q||p))
+    # for a genuinely different pair.
+    q_dist = np.array([0.4, 0.5, 0.1])
+    kl_pq = kl_divergence(p_dist, q_dist)
+    kl_qp = kl_divergence(q_dist, p_dist)
+    assert kl_pq > 0 and kl_qp > 0
+    assert not np.isclose(kl_pq, kl_qp)
+    print("kl_divergence (Gibbs' inequality + asymmetry) OK", kl_pq, kl_qp)
+
+    # Cross-entropy must diverge to +inf when q rules out an outcome p
+    # considers possible (log(0), correctly propagated, not a crash).
+    with np.errstate(divide="ignore"):
+        assert cross_entropy([0.5, 0.5], [1.0, 0.0]) == np.inf
+    print("cross_entropy divergence OK")
+
+    # JSD is symmetric by construction, and hits its known maximum
+    # (log(2) nats) for two distributions with disjoint support.
+    assert np.isclose(js_divergence(p_dist, q_dist), js_divergence(q_dist, p_dist))
+    assert np.isclose(js_divergence([1.0, 0.0], [0.0, 1.0]), np.log(2))
+    print("js_divergence (symmetry + bound) OK")
+
+    # Confident-and-correct predictions should cost far less loss than
+    # confident-and-wrong ones.
+    bce_good = binary_cross_entropy([1, 0], [0.999, 0.001])
+    bce_bad = binary_cross_entropy([1, 0], [0.001, 0.999])
+    assert bce_good < 0.01 < 5.0 < bce_bad
+    print("binary_cross_entropy OK", bce_good, bce_bad)
 
     assert jaccard_similarity({1, 2, 3}, {2, 3, 4}) == 0.5
     assert abs(weighted_jaccard_similarity([1, 2, 0], [1, 0, 3]) - (1 / 6)) < 1e-9

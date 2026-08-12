@@ -1,6 +1,6 @@
 """Deep learning primitives: batch norm, 1D convolution, activations
-(sigmoid, ReLU), a two-layer MLP forward/backward pass, attention, beam
-search."""
+(sigmoid, ReLU), a two-layer MLP forward/backward pass, softmax +
+cross-entropy loss (with gradient), attention, beam search."""
 
 from typing import List
 
@@ -299,6 +299,23 @@ class TwoLayerMLP:
         }
 
 
+def softmax(x, axis=-1):
+    """Numerically-stable softmax: turns arbitrary real-valued scores
+    along `axis` into a probability distribution (non-negative, sums to
+    1 along that axis).
+
+    Stability trick: subtract the max along `axis` before exponentiating.
+    exp() of a large positive score overflows to inf; subtracting the max
+    first guarantees every exponent is <= 0, so every exp() output lands
+    safely in (0, 1]. This doesn't change the *result* -- softmax(x) ==
+    softmax(x - c) for any constant c, since the shift cancels out once
+    you divide by the sum -- only its numerical behavior.
+    """
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+
 def scaled_dot_product_attention(Q, K, V, mask=None):
     """Scaled dot-product attention, the core of the Transformer
     (Vaswani et al., 2017): "Attention is All You Need".
@@ -324,11 +341,49 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
         # assigns them ~0 probability (e.g. causal masking, padding masking).
         scores = np.where(mask, scores, -np.inf)
 
-    # Numerically-stable softmax: subtract the row max before exponentiating.
-    scores = scores - scores.max(axis=-1, keepdims=True)
-    weights = np.exp(scores)
-    weights /= weights.sum(axis=-1, keepdims=True)   # normalize each query's row to sum to 1
+    weights = softmax(scores, axis=-1)   # each query's row becomes a probability distribution
     return weights @ V, weights   # weighted combination of the value vectors
+
+
+def softmax_cross_entropy(logits, y_true):
+    """Softmax + cross-entropy loss, and its gradient w.r.t. the raw
+    logits -- the standard training loss for classification, and for
+    next-token prediction in LLMs (predicting the next token is just
+    classification over the vocabulary, applied at every position).
+
+    Forward: turn each row of raw logits into a probability distribution
+    via softmax, then take the negative log-probability the model
+    assigned to the true class, averaged over the batch:
+        probs = softmax(logits)                          # (N, C)
+        loss  = -mean_i( log(probs[i, y_true[i]]) )
+
+    Backward (a classic, elegant result worth knowing the derivation
+    for, not just the formula): differentiating the *combined*
+    softmax + cross-entropy w.r.t. the logits collapses into
+        d(loss)/d(logits) = (probs - one_hot(y_true)) / N
+    i.e. "how far the predicted distribution is from the one-hot true
+    label," scaled by 1/N. This clean form is exactly *why* softmax and
+    cross-entropy are almost always paired: differentiating softmax's
+    own Jacobian and cross-entropy's separately would be far messier,
+    but composed together their derivatives telescope down to this.
+
+    logits: (N, C) raw (pre-softmax) scores.
+    y_true: (N,) integer class index per example, in [0, C).
+    """
+    probs = softmax(logits, axis=-1)             # (N, C)
+    N = logits.shape[0]
+
+    # Fancy-index out, for each example, the probability mass its own
+    # true class received -- that's the only part of the distribution
+    # cross-entropy actually penalizes.
+    correct_class_probs = probs[np.arange(N), y_true]
+    loss = -np.mean(np.log(correct_class_probs + 1e-12))  # eps: guard against log(0)
+
+    one_hot = np.zeros_like(probs)
+    one_hot[np.arange(N), y_true] = 1.0
+    dlogits = (probs - one_hot) / N
+
+    return loss, dlogits
 
 
 def beam_search(start_seq, score_fn, beam_width, max_len, eos_token):
@@ -479,6 +534,36 @@ if __name__ == "__main__":
     out, weights = scaled_dot_product_attention(Q, K, V)
     assert np.allclose(weights.sum(axis=-1), 1.0)   # each row is a valid probability distribution
     print("scaled_dot_product_attention OK")
+
+    assert np.allclose(softmax(np.array([1.0, 1.0, 1.0])), [1 / 3, 1 / 3, 1 / 3])
+    assert np.allclose(softmax(np.array([1000.0, 0.0])), [1.0, 0.0])   # no overflow
+    print("softmax OK")
+
+    logits = np.array([[2.0, 1.0, 0.1, -1.0], [0.5, 0.2, 3.0, -0.5], [-1.0, 0.0, 0.5, 4.0]])
+    y_true_labels = np.array([0, 2, 3])
+    loss, dlogits = softmax_cross_entropy(logits, y_true_labels)
+    assert loss > 0
+
+    # Numerical gradient check on every logit entry, same technique used
+    # for TwoLayerMLP and batch_norm_backward above.
+    numerical_dlogits = np.zeros_like(logits)
+    eps = 1e-5
+    for idx in np.ndindex(logits.shape):
+        original = logits[idx]
+        logits[idx] = original + eps
+        loss_plus, _ = softmax_cross_entropy(logits, y_true_labels)
+        logits[idx] = original - eps
+        loss_minus, _ = softmax_cross_entropy(logits, y_true_labels)
+        logits[idx] = original
+        numerical_dlogits[idx] = (loss_plus - loss_minus) / (2 * eps)
+    assert np.allclose(dlogits, numerical_dlogits, atol=1e-6)
+
+    # A confidently-correct prediction should cost far less loss than a
+    # confidently-wrong one.
+    confident_correct_loss, _ = softmax_cross_entropy(np.array([[100.0, 0.0]]), np.array([0]))
+    confident_wrong_loss, _ = softmax_cross_entropy(np.array([[0.0, 100.0]]), np.array([0]))
+    assert confident_correct_loss < 1e-6 < confident_wrong_loss
+    print("softmax_cross_entropy OK", loss, dlogits)
 
     # Toy scorer: token "b" always scores higher than "a"; force <eos> once
     # the sequence reaches length 3, so beam search should learn to prefer
