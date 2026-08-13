@@ -1,4 +1,6 @@
-"""Systems/efficiency: sparse matmul, quantization, packed vectors, load balancing, sampling."""
+"""Systems/efficiency: sparse matrix formats (CSR for fast matmul, DOK
+for cheap mutation) and conversion between them, quantization, packed
+vectors, load balancing, sampling."""
 
 import bisect
 import hashlib
@@ -56,6 +58,104 @@ class SparseMatrixCSR:
                 for j in range(out_cols):
                     result[i][j] += val * other[col][j]
         return result
+
+    @classmethod
+    def _from_csr_arrays(cls, shape, data, indices, indptr):
+        """Build a SparseMatrixCSR directly from already-computed CSR
+        arrays, bypassing __init__'s dense-matrix scan. Used by
+        SparseMatrixDOK.to_csr() below so that converting a DOK matrix
+        never has to materialize an O(rows*cols) dense intermediate --
+        the whole point of staying sparse.
+        """
+        obj = cls.__new__(cls)   # allocate without calling __init__
+        obj.shape = shape
+        obj.data = data
+        obj.indices = indices
+        obj.indptr = indptr
+        return obj
+
+
+class SparseMatrixDOK:
+    """Dictionary-Of-Keys (DOK) sparse matrix: the mutation-friendly
+    counterpart to SparseMatrixCSR above.
+
+    Motivation: CSR's flat, contiguous arrays are great for *reading*
+    (fast matmul, low memory -- see SparseMatrixCSR's docstring) but bad
+    for *writing*: inserting one new non-zero means shifting every later
+    entry in `data`/`indices` to keep each row contiguous, an O(nnz)
+    operation. DOK instead stores entries in a plain dict keyed by
+    `(row, col)`, giving O(1) average-case get/set/delete of individual
+    entries -- at the cost of losing CSR's memory density and
+    row-contiguous layout, so it's deliberately *not* the format you'd
+    want to run repeated matmuls against.
+
+    The standard real-world workflow, which this class is built to
+    support directly via to_csr(): build the matrix incrementally here
+    (cheap random writes), then convert *once* to CSR before doing any
+    heavy compute. You typically construct a sparse matrix once but
+    multiply it many times, so you want cheap construction and a fast,
+    compact format for the repeated part -- not the same format doing
+    both jobs badly.
+    """
+
+    def __init__(self, shape):
+        self.shape = shape
+        self._entries = {}   # (row, col) -> non-zero value; missing key means 0
+
+    def __setitem__(self, key, value):
+        i, j = key
+        if not (0 <= i < self.shape[0] and 0 <= j < self.shape[1]):
+            raise IndexError(f"index {key} out of bounds for shape {self.shape}")
+        if value == 0:
+            # Keep the invariant "only non-zeros are stored": assigning 0
+            # should shrink the matrix, not add an explicit zero entry.
+            self._entries.pop(key, None)
+        else:
+            self._entries[key] = value
+
+    def __getitem__(self, key):
+        # Any (row, col) never explicitly set is implicitly 0 -- that's
+        # the entire premise of a sparse representation.
+        return self._entries.get(key, 0.0)
+
+    @property
+    def nnz(self):
+        """Number of explicitly-stored non-zero entries."""
+        return len(self._entries)
+
+    def to_dense(self):
+        rows, cols = self.shape
+        dense = [[0.0] * cols for _ in range(rows)]
+        for (i, j), val in self._entries.items():
+            dense[i][j] = val
+        return dense
+
+    def to_csr(self):
+        """Convert to SparseMatrixCSR for fast repeated compute.
+
+        Sorting `self._entries.items()` sorts by the (row, col) tuple key
+        directly, so it comes out grouped by row (and column-ordered
+        within each row) with no extra work -- exactly the order CSR's
+        three arrays need. Walking that sorted list once, row by row, and
+        closing off `indptr` after each row (whether or not that row had
+        any entries) builds the CSR arrays in O(nnz log nnz) time --
+        never touching the O(rows*cols) zero entries a dense-matrix
+        round-trip would.
+        """
+        sorted_items = sorted(self._entries.items())
+        data, indices, indptr = [], [], [0]
+        entry_idx = 0
+        n_entries = len(sorted_items)
+
+        for row in range(self.shape[0]):
+            while entry_idx < n_entries and sorted_items[entry_idx][0][0] == row:
+                (_, col), val = sorted_items[entry_idx]
+                data.append(val)
+                indices.append(col)
+                entry_idx += 1
+            indptr.append(len(data))   # close off this row, empty or not
+
+        return SparseMatrixCSR._from_csr_arrays(self.shape, data, indices, indptr)
 
 
 def quantize(x, num_bits=8, symmetric=True):
@@ -241,6 +341,35 @@ if __name__ == "__main__":
     expected = [[1, 0], [3, 5], [0, 0]]
     assert sparse.matmul_dense(other) == expected
     print("SparseMatrixCSR OK")
+
+    dok = SparseMatrixDOK((3, 3))
+    dok[0, 0] = 1
+    dok[1, 1] = 2
+    dok[1, 2] = 3
+    dok[2, 2] = 5
+    dok[2, 2] = 0    # assigning 0 must delete the entry, not store a literal 0
+    dok[2, 0] = 4
+    assert dok.nnz == 4   # (2,2) was removed, so only 4 entries remain
+    assert dok[0, 1] == 0.0   # never-set entries default to 0
+    assert dok[1, 2] == 3
+    assert dok.to_dense() == [[1, 0, 0], [0, 2, 3], [4, 0, 0]]
+    try:
+        dok[5, 5] = 1
+        assert False, "expected an out-of-bounds IndexError"
+    except IndexError:
+        pass
+    print("SparseMatrixDOK OK", dok.to_dense())
+
+    # DOK -> CSR conversion must produce byte-for-byte the same arrays as
+    # building the CSR matrix directly from the equivalent dense matrix,
+    # and therefore identical matmul results.
+    csr_from_dok = dok.to_csr()
+    csr_direct = SparseMatrixCSR(dok.to_dense())
+    assert csr_from_dok.data == csr_direct.data
+    assert csr_from_dok.indices == csr_direct.indices
+    assert csr_from_dok.indptr == csr_direct.indptr
+    assert csr_from_dok.matmul_dense(other) == csr_direct.matmul_dense(other)
+    print("SparseMatrixDOK.to_csr OK", csr_from_dok.matmul_dense(other))
 
     values = [-1.0, -0.5, 0.0, 0.5, 1.0]
     q, scale, zp = quantize(values, num_bits=8, symmetric=True)
