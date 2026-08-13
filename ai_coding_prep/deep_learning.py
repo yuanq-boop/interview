@@ -351,38 +351,59 @@ def softmax_cross_entropy(logits, y_true):
     next-token prediction in LLMs (predicting the next token is just
     classification over the vocabulary, applied at every position).
 
-    Forward: turn each row of raw logits into a probability distribution
-    via softmax, then take the negative log-probability the model
-    assigned to the true class, averaged over the batch:
-        probs = softmax(logits)                          # (N, C)
-        loss  = -mean_i( log(probs[i, y_true[i]]) )
+    Written with plain Python loops over examples and classes instead of
+    vectorized numpy indexing tricks, so every line maps directly onto
+    the math with nothing to decode -- at the cost of being slower than
+    a fully vectorized version. If you were writing this for real
+    (large batches/vocabularies) you'd vectorize it; this version
+    optimizes for "obviously correct" over "fast."
+
+    Forward, for each example i independently: turn its row of raw
+    logits into a probability distribution via softmax, then take the
+    negative log of the probability it assigned to the true class.
+    Average that over the batch:
+        probs_i = softmax(logits[i])
+        loss_i  = -log(probs_i[y_true[i]])
+        loss    = mean_i(loss_i)
 
     Backward (a classic, elegant result worth knowing the derivation
     for, not just the formula): differentiating the *combined*
-    softmax + cross-entropy w.r.t. the logits collapses into
-        d(loss)/d(logits) = (probs - one_hot(y_true)) / N
-    i.e. "how far the predicted distribution is from the one-hot true
-    label," scaled by 1/N. This clean form is exactly *why* softmax and
+    softmax + cross-entropy for example i, w.r.t. its own logits,
+    collapses into
+        d(loss_i)/d(logits[i][c]) = probs_i[c] - 1{c == y_true[i]}
+    i.e. "how far the predicted probability for class c is from the
+    one-hot target for class c" -- 1 if c is the true class, 0
+    otherwise. This clean form is exactly *why* softmax and
     cross-entropy are almost always paired: differentiating softmax's
     own Jacobian and cross-entropy's separately would be far messier,
     but composed together their derivatives telescope down to this.
+    Divide by N (number of examples) since the forward pass averaged
+    over the batch too.
 
     logits: (N, C) raw (pre-softmax) scores.
     y_true: (N,) integer class index per example, in [0, C).
     """
-    probs = softmax(logits, axis=-1)             # (N, C)
-    N = logits.shape[0]
+    N, C = logits.shape
+    dlogits = np.zeros_like(logits)
+    total_loss = 0.0
 
-    # Fancy-index out, for each example, the probability mass its own
-    # true class received -- that's the only part of the distribution
-    # cross-entropy actually penalizes.
-    correct_class_probs = probs[np.arange(N), y_true]
-    loss = -np.mean(np.log(correct_class_probs + 1e-12))  # eps: guard against log(0)
+    for i in range(N):
+        probs_i = softmax(logits[i])   # this example's predicted distribution, shape (C,)
+        true_class = y_true[i]
 
-    one_hot = np.zeros_like(probs)
-    one_hot[np.arange(N), y_true] = 1.0
-    dlogits = (probs - one_hot) / N
+        # Only the probability mass assigned to the *true* class matters
+        # for the loss -- that's the whole "how surprised was the model
+        # by the right answer" idea. +eps guards against log(0).
+        total_loss += -np.log(probs_i[true_class] + 1e-12)
 
+        # Gradient for every class c of this example: probs_i[c] minus 1
+        # if c is the true class, else minus 0 -- built explicitly with a
+        # loop instead of constructing a one-hot vector in one shot.
+        for c in range(C):
+            target = 1.0 if c == true_class else 0.0
+            dlogits[i, c] = (probs_i[c] - target) / N
+
+    loss = total_loss / N
     return loss, dlogits
 
 
