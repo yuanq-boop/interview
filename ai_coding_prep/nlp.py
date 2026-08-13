@@ -1,6 +1,5 @@
 """NLP: byte-pair encoding (BPE) tokenizer training."""
 
-import re
 from collections import Counter, defaultdict
 
 
@@ -38,15 +37,39 @@ def get_pair_counts(word_freqs):
 
 
 def merge_pair(pair, word_freqs):
-    """Apply one merge everywhere it occurs: replace every occurrence of
-    the space-separated pair (e.g. "l o") with the fused symbol ("lo") in
-    every word. The negative lookaround/lookahead (?<!\\S)...(?!\\S)
-    ensures we only match the pair as whole adjacent tokens (bounded by
-    spaces or string edges), not as a substring inside a longer symbol.
+    """Apply one merge everywhere it occurs: for every word, walk its
+    symbols left to right and fuse any adjacent pair that matches -- the
+    same list-walking technique apply_bpe (below) uses to apply learned
+    merges to new text, so there's one mental model for both "learn a
+    merge" and "apply a merge" instead of two.
+
+    Operating on word.split() (an actual list of tokens) rather than the
+    raw string sidesteps the classic bug this kind of code can have: a
+    plain string search for "l o" could accidentally match those two
+    characters *inside* a longer symbol (e.g. the "o" in "lo" followed by
+    a space and a "w" would look like "o w" to a naive substring search).
+    Once the word is split into a list, that's structurally impossible --
+    "lo" is one list element, never two -- so no special-casing is needed
+    to keep matches confined to whole, adjacent symbols.
     """
-    pattern = re.compile(r"(?<!\S)" + re.escape(" ".join(pair)) + r"(?!\S)")
-    merged = "".join(pair)
-    return {pattern.sub(merged, word): freq for word, freq in word_freqs.items()}
+    first, second = pair
+    merged = first + second
+    new_word_freqs = {}
+
+    for word, freq in word_freqs.items():
+        symbols = word.split()
+        new_symbols = []
+        i = 0
+        while i < len(symbols):
+            if i < len(symbols) - 1 and symbols[i] == first and symbols[i + 1] == second:
+                new_symbols.append(merged)   # fuse the two symbols into one
+                i += 2                       # skip both -- they're now consumed
+            else:
+                new_symbols.append(symbols[i])
+                i += 1
+        new_word_freqs[" ".join(new_symbols)] = freq
+
+    return new_word_freqs
 
 
 def train_bpe(corpus, num_merges):
