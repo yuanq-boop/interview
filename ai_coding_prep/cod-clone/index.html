@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#0c0f11" />
+    <link rel="icon" href="data:," />
+    <title>Blackline Ops</title>
+  </head>
+  <body>
+    <main id="app">
+      <canvas id="game-canvas" aria-label="Blackline Ops first-person shooter"></canvas>
+
+      <section id="hud" aria-hidden="true">
+        <div id="damage-vignette"></div>
+        <div id="low-health-pulse"></div>
+
+        <div id="reticle">
+          <div id="crosshair">
+            <span class="cross-arm cross-top"></span>
+            <span class="cross-arm cross-bottom"></span>
+            <span class="cross-arm cross-left"></span>
+            <span class="cross-arm cross-right"></span>
+            <span id="cross-dot"></span>
+          </div>
+          <div id="hitmarker">
+            <span></span><span></span><span></span><span></span>
+          </div>
+          <div id="damage-indicators"></div>
+        </div>
+
+        <div id="hud-top-left">
+          <div class="score-block">
+            <span class="score-label">Score</span>
+            <strong id="score-value">0</strong>
+          </div>
+          <div id="streak-chip" class="streak-chip">
+            <span id="streak-value">x1</span>
+            <span class="streak-label">streak</span>
+          </div>
+        </div>
+
+        <div id="hud-top-right">
+          <div class="wave-block">
+            <span class="wave-label">Wave</span>
+            <strong id="wave-value">1</strong>
+          </div>
+          <div id="enemy-counter" class="enemy-counter">
+            <span id="enemy-remaining">0</span>
+            <span class="enemy-label">hostiles</span>
+          </div>
+          <ul id="killfeed"></ul>
+        </div>
+
+        <div id="hud-bottom-left">
+          <div class="health-block">
+            <div class="health-head">
+              <span id="health-label">Armor</span>
+              <span id="health-value">100</span>
+            </div>
+            <div class="health-track"><div id="health-fill"></div></div>
+          </div>
+          <div id="grenade-block" class="grenade-block">
+            <span class="grenade-icon" aria-hidden="true"></span>
+            <span id="grenade-count">2</span>
+          </div>
+        </div>
+
+        <div id="hud-bottom-right">
+          <div id="weapon-name">MK-4 Carbine</div>
+          <div class="ammo-line">
+            <strong id="ammo-mag">30</strong>
+            <span id="ammo-reserve">/ 210</span>
+          </div>
+          <div id="reload-bar" class="reload-bar"><div id="reload-fill"></div></div>
+          <ul id="weapon-slots"></ul>
+        </div>
+
+        <div id="wave-banner"><span id="wave-banner-text"></span></div>
+        <div id="hud-toast"></div>
+      </section>
+
+      <div id="touch-controls" aria-hidden="true">
+        <div id="touch-look"></div>
+        <div id="touch-stick"><div id="touch-knob"></div></div>
+        <div id="touch-buttons">
+          <button id="touch-reload" type="button" class="touch-button">R</button>
+          <button id="touch-swap" type="button" class="touch-button">SWAP</button>
+          <button id="touch-grenade" type="button" class="touch-button">NADE</button>
+          <button id="touch-crouch" type="button" class="touch-button">CRCH</button>
+          <button id="touch-jump" type="button" class="touch-button">JUMP</button>
+          <button id="touch-ads" type="button" class="touch-button">ADS</button>
+        </div>
+        <button id="touch-fire" type="button" class="touch-button touch-fire">FIRE</button>
+      </div>
+
+      <section id="overlay">
+        <div id="overlay-card">
+          <p id="overlay-kicker">Operation</p>
+          <h1 id="overlay-title">Blackline Ops</h1>
+          <p id="overlay-body">
+            Hostiles are pushing the compound. Clear every wave and stay alive.
+          </p>
+          <dl id="overlay-stats"></dl>
+          <button id="overlay-action" type="button">Click to deploy</button>
+          <ul id="overlay-controls">
+            <li><kbd>WASD</kbd> move</li>
+            <li><kbd>Mouse</kbd> look</li>
+            <li><kbd>LMB</kbd> fire</li>
+            <li><kbd>RMB</kbd> aim</li>
+            <li><kbd>R</kbd> reload</li>
+            <li><kbd>Shift</kbd> sprint</li>
+            <li><kbd>Ctrl</kbd> crouch</li>
+            <li><kbd>Space</kbd> jump</li>
+            <li><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> weapons</li>
+            <li><kbd>G</kbd> grenade</li>
+            <li><kbd>M</kbd> mute</li>
+            <li><kbd>Esc</kbd> pause</li>
+          </ul>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
